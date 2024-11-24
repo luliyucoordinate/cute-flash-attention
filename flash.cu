@@ -195,7 +195,6 @@ __global__ void flash_forward(void* output, const void* q, const void* k,
     for (int si = 0; si < size<0>(scores); si++) {
       float& scores_max_si = scores_max(si);
       float& scores_sum_si = scores_sum(si);
-      float scores_sum_cnt = 0;
 #pragma unroll
       for (int sj = 0; sj < size<1>(scores); sj++) {
         scores_max_si = max(scores_max_si, scores(si, sj));
