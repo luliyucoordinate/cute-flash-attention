@@ -37,9 +37,10 @@ __global__ void flash_forward(void* output, const void* q, const void* k,
   auto q_shm = (T*)shm_data;
   auto k_shm = q_shm + cosize(SmemLayoutQ{});
   auto v_shm = k_shm + cosize(SmemLayoutK{});
+  auto shm_stride = config::kShmSize / 16 / blockDim.x;
 #pragma unroll
-  for (int i = 0; i < config::kShmSize / 16 / blockDim.x; i++) {
-    shm_data[i] = {0, 0, 0, 0};
+  for (int i = 0; i < shm_stride; i++) {
+    shm_data[i + shm_stride * tidx] = {0, 0, 0, 0};
   }
   __syncthreads();
 
@@ -191,6 +192,7 @@ __global__ void flash_forward(void* output, const void* q, const void* k,
     // softmax
     auto scores_max_pre = make_fragment_like(scores_max);
     cute::copy(scores_max, scores_max_pre);
+    auto scores_sum_cur = make_fragment_like(scores_sum);
 #pragma unroll
     for (int si = 0; si < size<0>(scores); si++) {
       float& scores_max_si = scores_max(si);
@@ -210,7 +212,7 @@ __global__ void flash_forward(void* output, const void* q, const void* k,
       for (int sj = 0; sj < size<1>(rAccOut_new); sj++) {
         rAccOut_new(si, sj) *= scores_scale;
       }
-      auto scores_sum_cur = make_fragment_like(scores_sum);
+
       float& scores_sum_cur_si = scores_sum_cur(si);
       scores_sum_cur_si = 0;
 #pragma unroll
@@ -220,10 +222,7 @@ __global__ void flash_forward(void* output, const void* q, const void* k,
       }
       scores_sum_cur_si += __shfl_xor_sync(0xffffffff, scores_sum_cur_si, 0x2);
       scores_sum_cur_si += __shfl_xor_sync(0xffffffff, scores_sum_cur_si, 0x1);
-#pragma unroll
-      for (int sj = 0; sj < size(scores_sum); sj++) {
-        scores_sum(sj) += scores_sum_cur(sj);
-      }
+      scores_sum_si += scores_sum_cur_si;
     }
 
     __syncthreads();
@@ -240,7 +239,7 @@ __global__ void flash_forward(void* output, const void* q, const void* k,
     __syncthreads();
 
     // O = softmax(S)*V
-    auto scores_fp16 = make_tensor<half_t>(shape(scores));
+    auto scores_fp16 = make_tensor_like<half_t>(scores);
     auto scores_fp32x2 = recast<float2>(scores);
     auto scores_fp16x2 = recast<half2>(scores_fp16);
 #pragma unroll
@@ -291,7 +290,7 @@ __global__ void flash_forward(void* output, const void* q, const void* k,
   }
 
   // write back
-  auto rAccOut_fp16 = make_tensor<half_t>(shape(rAccOut));
+  auto rAccOut_fp16 = make_tensor_like<half_t>(rAccOut);
   auto rAccOut_fp32x2 = recast<float2>(rAccOut);
   auto rAccOut_fp16x2 = recast<half2>(rAccOut_fp16);
 #pragma unroll
@@ -362,7 +361,6 @@ struct FlashConfig {
       SmemLayoutAtomO{}, Shape<Int<kBlockM>, Int<kHeadDim>>{}));
   using SmemCopyAtomO = Copy_Atom<DefaultCopy, T>;
 
-  // TODO(11117913): using mma_op = SM80_16x8x16_F16F16F16F16_TN;
   using mma_op = SM80_16x8x16_F32F16F16F32_TN;
   using mma_traits = MMA_Traits<mma_op>;
   using mma_atom = MMA_Atom<mma_traits>;
