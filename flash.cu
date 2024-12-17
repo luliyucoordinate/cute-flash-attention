@@ -33,16 +33,10 @@ __global__ void flash_forward(void* output, const void* q, const void* k,
   constexpr int kBlockN = config::kBlockN;
   constexpr int kHeadDim = config::kHeadDim;
 
-  extern __shared__ int4 shm_data[];
-  auto q_shm = (T*)shm_data;
+  extern __shared__ T shm_data[];
+  auto q_shm = shm_data;
   auto k_shm = q_shm + cosize(SmemLayoutQ{});
   auto v_shm = k_shm + cosize(SmemLayoutK{});
-  auto shm_stride = config::kShmSize / 16 / blockDim.x;
-#pragma unroll
-  for (int i = 0; i < shm_stride; i++) {
-    shm_data[i + shm_stride * tidx] = {0, 0, 0, 0};
-  }
-  __syncthreads();
 
   const int bs_head_offset = base_id * head_stride;
 
@@ -147,7 +141,7 @@ __global__ void flash_forward(void* output, const void* q, const void* k,
 #pragma unroll
   for (int ii = 0; ii < size(scores_max); ii++) {
     scores_max(ii) = float(-5e4);
-    scores_sum(ii) = 1.0;
+    scores_sum(ii) = 0;
   }
 
   // ((2,2),MMA_M,MMA_N) to ((2,MMA_M),(2,MMA_N))
@@ -192,7 +186,6 @@ __global__ void flash_forward(void* output, const void* q, const void* k,
     // softmax
     auto scores_max_pre = make_fragment_like(scores_max);
     cute::copy(scores_max, scores_max_pre);
-    auto scores_sum_cur = make_fragment_like(scores_sum);
 #pragma unroll
     for (int si = 0; si < size<0>(scores); si++) {
       float& scores_max_si = scores_max(si);
@@ -207,14 +200,12 @@ __global__ void flash_forward(void* output, const void* q, const void* k,
           max(scores_max_si, __shfl_xor_sync(0xffffffff, scores_max_si, 0x1));
 
       float scores_scale = exp2f(scores_max_pre(si) - scores_max_si);
-      scores_sum_si *= scores_scale;
 #pragma unroll
       for (int sj = 0; sj < size<1>(rAccOut_new); sj++) {
         rAccOut_new(si, sj) *= scores_scale;
       }
 
-      float& scores_sum_cur_si = scores_sum_cur(si);
-      scores_sum_cur_si = 0;
+      float scores_sum_cur_si = 0;
 #pragma unroll
       for (int sj = 0; sj < size<1>(scores); sj++) {
         scores(si, sj) = exp2f(scores(si, sj) - scores_max_si);
@@ -222,7 +213,7 @@ __global__ void flash_forward(void* output, const void* q, const void* k,
       }
       scores_sum_cur_si += __shfl_xor_sync(0xffffffff, scores_sum_cur_si, 0x2);
       scores_sum_cur_si += __shfl_xor_sync(0xffffffff, scores_sum_cur_si, 0x1);
-      scores_sum_si += scores_sum_cur_si;
+      scores_sum_si = scores_sum_si * scores_scale + scores_sum_cur_si;
     }
 
     __syncthreads();
